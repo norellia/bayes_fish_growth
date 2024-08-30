@@ -1,11 +1,19 @@
-#run cleaning first to set up the data
+# Run cleaning first to set up the data, this script handles all of the JAGS runs
+# Dataframes from cleaning: cleaned_wtpa = all, wtpa = measured
 
-setwd("D:/Documents/RSMAS/Bayesian/Project/final")
+# This script creates and runs 3 JAGS models, one with just the measured length at ages, one with all the length at ages, and a third with a subset of ages 1-5.  
+# Loosely based off Ortiz de Zárate and Babcock (2016).  
+
+# Load Packages
 library(R2jags)
 library(ggmcmc)
 
-#dataframes from cleaning: df1 = all, wtpa = measured, sub = subset
 
+##### All Measured Data ######
+
+# Create model.file for JAGS
+# I looped through 282 observations to find a von Bertalanffy curve that would fit the measured data
+# The priors were selected based off the general range of White Perch growth curves
 write("model
       {
       for(i in 1:282){
@@ -39,39 +47,46 @@ write("model
       
       }", file = "vonBwtp.txt")
 
-init1=list(tau=1,K=0.6)
-init2=list(tau=0.5,K=0.4)
+# Set initial values for JAGS
+init1 <- list(tau=1,K=0.6)
+init2 <- list(tau=0.5,K=0.4)
 
-##### All Measured Data ######
+# Create a copy of wtpa (might remove this)
 wtp <- wtpa
 
+# Run JAGS model with 400,000 iterations, 50,000 burn in, and 100 thin
 wtpjags=jags(wtp,list(init1,init2),model.file="vonBwtp.txt",
              parameters.to.save=c("K","Linf","tau","Age0","p.value","r.squared","r.squared2",
                                   "PredL","logPredL"),
              n.chains=2,n.iter=400000,n.burnin=50000,n.thin=100)
 
-res1=wtpjags$BUGSoutput
-res1$summary
-round(res1$summary[c("Age0", "K","Linf","p.value","r.squared","r.squared2"),c("mean","sd","2.5%","50%","97.5%","Rhat","n.eff")],5)
+# Create and look at JAGS output
+res1 <- wtpjags$BUGSoutput
+head(res1$summary)
+round(res1$summary[c("Age0", "K","Linf","p.value","r.squared","r.squared2"),c("mean","sd","2.5%","50%","97.5%","Rhat","n.eff")],3)
 
+# Plot the glm line of the mean with confidence intervals over a scatter plot of the data 
+df <- data.frame(res1$summary[paste0("PredL[",1:282,"]"),c("mean","2.5%","50%","97.5%")])
+names(df) <- c("mean","lci","median","uci")
+df <- cbind(df,wtp)
+ggplot(df, aes(x=Age, y=Length, ymin=lci, ymax=uci))+
+  geom_point() +
+  geom_ribbon(alpha=0.3) +
+  theme_bw() +
+  geom_line(aes(x=Age,y=mean)) +
+  ylab("Length")
 
-
-df<-data.frame(res1$summary[paste0("PredL[",1:282,"]"),c("mean","2.5%","50%","97.5%")])
-names(df)<-c("mean","lci","median","uci")
-df<-cbind(df,wtp)
-ggplot(df,aes(x=Age,y=Length,ymin=lci,ymax=uci))+geom_point()+geom_ribbon(alpha=0.3)+theme_bw()+geom_line(aes(x=Age,y=mean))+ylab("Length")
-
+# Print the DIC and pD
 res1$DIC
 res1$pD
 
+# Do a second run and save just the vonB parameters to make the gelman plots 
 wtpjags2=jags(wtp,list(init1,init2),model.file="vonBwtp.txt",
              parameters.to.save=c("K","Linf","Age0"),
              n.chains=2,n.iter=400000,n.burnin=50000,n.thin=100)
 
 mc1 <- as.mcmc(wtpjags2)
 gelman.plot(mc1)
-
-
 
 ##### All Measured Data and Back-Calculations #####
 write("model
@@ -106,7 +121,7 @@ write("model
       r.squared2 <-1-1/(tau*sd(logObsL[])*sd(logObsL[]))
       }", file = "vonBwtp2.txt")
 
-wtp <- df1
+wtp <- cleaned_wtpa
 
 wtpjags3=jags(wtp,list(init1,init2),model.file="vonBwtp2.txt",
              parameters.to.save=c("K","Linf","tau", "Age0","r.squared", "p.value","r.squared2",
@@ -134,15 +149,15 @@ mc2 <- as.mcmc(wtpjags4)
 gelman.plot(mc2)
 
 ##### Subset #####
-
+# The final model used a subsample of ages 1-5 where each age had 100 samples where the measured length at ages were supplemented by however many back-calculated ages were needed to reach 100 samples.   
 df_3 = 0
 for(i in 1:5){
   #only get less than or equal to age i
-  s <- filter(df1, Age <= i)
+  s <- filter(cleaned_wtpa, Age <= i)
   s <- filter(s, (i-1) < Age)
   #only get = to age i 
-  s.b <- filter(s, BC == "Back-Calc")
-  s.a <- filter(s, BC == "Measured")
+  s.b <- filter(s, Type == "Back-Calc")
+  s.a <- filter(s, Type == "Measured")
   x = 100 - nrow(s.a)
   s.b <- sample_n(s.b, x)
   df_3 <- rbind(df_3, s.a, s.b)
@@ -150,7 +165,7 @@ for(i in 1:5){
 df_3 <- df_3[-1,]
 
 df_3$round <- ceiling(df_3$Age)
-ggplot(df_3, aes(round, fill = BC)) +
+ggplot(df_3, aes(round, fill = Type)) +
   geom_histogram(bins = 5, color = "black") + scale_fill_manual(values=c("white", "black"))+ggtitle("Histogram of Fish Age") + ylab("Count") + theme_classic()
 
 
@@ -220,5 +235,5 @@ densplot(mc2)
 densplot(mc1)   
 densplot(mc3)   
 
-ggplot(df1,aes(x=Age,y=Length))+geom_point()+theme_bw()+geom_line(data = df, aes(x=Age,y=mean))+geom_line(data = df2, aes(x=Age,y=mean), color = "blue")+geom_line(data = df3, aes(x=Age,y=mean), color = "red")+ylab("Length")
+ggplot(cleaned_wtpa,aes(x=Age,y=Length))+geom_point()+theme_bw()+geom_line(data = df, aes(x=Age,y=mean))+geom_line(data = df2, aes(x=Age,y=mean), color = "blue")+geom_line(data = df3, aes(x=Age,y=mean), color = "red")+ylab("Length")
 
