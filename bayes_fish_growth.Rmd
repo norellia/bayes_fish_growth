@@ -1,0 +1,396 @@
+---
+title: "A Series of Bayesian Fish Growth Models"
+author: "Alexandra Norelli"
+date: "2024-09-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+## Clean and Examine White Perch Otolith Data
+
+```{r, include = FALSE}
+# Load packages
+library(tidyverse)
+library(FSA)
+
+# Read in the white perch age data (wtpa)
+wtpa <- read.csv("all_bc.csv")
+
+# Reformat the back-calculated length at ages
+bc_wtpa <- pivot_longer(wtpa, c(ONE.L, TWO.L, THREE.L, FOUR.L, FIVE.L, SIX.L, SEVEN.L, EIGHT.L), names_to = "otolith", values_drop_na = TRUE)
+bc_wtpa$otolith <-as.factor(bc_wtpa$otolith)
+bc_wtpa$otolith <- factor(bc_wtpa$otolith, levels = c("ONE.L", "TWO.L", "THREE.L", "FOUR.L", "FIVE.L", "SIX.L", "SEVEN.L", "EIGHT.L"))
+bc_wtpa$otolith <- as.numeric(bc_wtpa$otolith)
+
+# Add a type of measurement variable
+wtpa$type <- rep("Measured")
+bc_wtpa$type <- rep("Back-Calc")
+
+# Merge the two types of datasets with cleaned variables
+cleaned_wtpa <- data.frame("Length" = c(bc_wtpa$value, wtpa$Length), "Age" = c(bc_wtpa$otolith, wtpa$Age), "Site" = c(bc_wtpa$Site, wtpa$Site), "Type" = c(bc_wtpa$type, wtpa$type))
+cleaned_wtpa$Type <- as.factor(cleaned_wtpa$Type)
+
+```
+
+## Histograms and Scatterplots
+
+``` {r}
+# Histogram of Fish Length
+ggplot(cleaned_wtpa, aes(Length, fill = Type)) +
+  geom_histogram(binwidth = 10, color = "black") + scale_fill_manual(values=c("white", "black")) +ggtitle("Histogram of Fish Length (cm)") + ylab("Count")+ theme_classic()
+
+# Histogram of Fish Ages
+ggplot(cleaned_wtpa, aes(Age, fill = Type)) +
+  geom_histogram(binwidth = 1, color = "black") + scale_fill_manual(values=c("white", "black"))+ggtitle("Histogram of Fish Age") + ylab("Count") + theme_classic()
+
+```
+
+``` {r}
+# Scatterplot of raw length at age by type
+ggplot(cleaned_wtpa, aes(x = Age, y = Length, color = Type)) +
+  geom_point() + 
+  scale_color_manual(values=c("#999999", "black")) + 
+  theme_bw() + 
+  ggtitle("Raw length at ages by measurement type")
+
+# Measured-type length at age by location
+mes <- filter(cleaned_wtpa, Type == "Measured")
+ggplot(mes, aes(x = Age, y = Length)) +
+  geom_point(aes(shape = Site, color = Site)) +
+  theme_bw() +
+  ggtitle("Measured otolith length at ages by location")
+
+# All length at ages by location
+ggplot(cleaned_wtpa, aes(x = Age, y = Length)) +
+  geom_point(aes(shape = Site)) + 
+  theme_bw() + 
+  ggtitle("All length at ages by location")
+
+```
+
+
+## JAGS Models
+
+These chunks create and run 3 JAGS models, one with just the measured length at ages, one with all the length at ages, and a third with a subset of ages 1-5.  Loosely based off Ortiz de Zárate and Babcock (2016).  
+
+```{r, include = FALSE}
+# Load Packages
+library(R2jags)
+library(ggmcmc)
+```
+
+### Model 1: Measured Otoliths Growth Curve
+
+```{r}
+
+##### All Measured Data ######
+
+# Create model.file for JAGS
+# I looped through 282 observations to find a von Bertalanffy curve that would fit the measured data
+# The priors were selected based off the general range of White Perch growth curves
+write("model
+      {
+      for(i in 1:282){
+        PredL[i] <- Linf * (1 - exp(-K*(Age[i] - Age0)))
+        logPredL[i] <- log(PredL[i])
+        Length[i] ~ dlnorm(logPredL[i], tau)
+			  logObsL[i] <-log(Length[i]) 	     # log transfomration of observed value
+			  resid[i] <- logObsL[i]-logPredL[i]  # residuals
+		 	  Rep[i] ~ dlnorm(logPredL[i], tau) # replicated data set
+		 	  logRep[i] <-log(Rep[i]) # replicated data set
+		 	  Prob[i] <- step(logRep[i] - logObsL[i])  # Probability replicated data>real data
+        sresid2[i]<-(logObsL[i]-logPredL[i])*(logObsL[i]-logPredL[i])*tau   # stand. residuals squared
+        rep.sresid2[i]<-(logRep[i]-logPredL[i])*(logRep[i]-logPredL[i])*tau  # replicated sresid squared
+        sstest[i] <- (logObsL[i]-logMean)*(logObsL[i]-logMean)*tau 
+      }
+      #priors specification
+      K ~ dunif(0,2)
+      Age0 ~ dunif(-10,0)
+      Linf ~ dunif(200,400)
+      tau ~ dgamma(0.001,0.001)
+      
+      #Derived parameters
+      logMean <-mean(logObsL[])
+      mean.prob<-mean(Prob[])
+      chi.square.obs<-sum(sresid2[])
+      chi.square.rep<-sum(rep.sresid2[])
+      sstot <-sum(sstest[])
+      p.value<-step(chi.square.obs-chi.square.rep)
+      r.squared <- 1-(chi.square.obs/sstot)
+      r.squared2 <-1-1/(tau*sd(logObsL[])*sd(logObsL[]))
+      
+      }", file = "vonBwtp.txt")
+
+# Set initial values for JAGS
+init1 <- list(tau=1,K=0.6)
+init2 <- list(tau=0.5,K=0.4)
+
+# Create a copy of wtpa
+wtp <- wtpa
+
+# Run JAGS model with 400,000 iterations, 50,000 burn in, and 100 thin
+wtpjags=jags(wtp,list(init1,init2),model.file="vonBwtp.txt",
+             parameters.to.save=c("K","Linf","tau","Age0","p.value","r.squared","r.squared2",
+                                  "PredL","logPredL"),
+             n.chains=2,n.iter=400000,n.burnin=50000,n.thin=100)
+
+# Create and look at JAGS output
+res1 <- wtpjags$BUGSoutput
+round(res1$summary[c("Age0", "K","Linf","p.value","r.squared","r.squared2"),c("mean","sd","2.5%","50%","97.5%","Rhat","n.eff")],3)
+
+```
+
+``` {r}
+# Plot the glm line of the mean with confidence intervals over a scatter plot of the data 
+df <- data.frame(res1$summary[paste0("PredL[",1:282,"]"),c("mean","2.5%","50%","97.5%")])
+names(df) <- c("mean","lci","median","uci")
+df <- cbind(df,wtp)
+ggplot(df, aes(x=Age, y=Length, ymin=lci, ymax=uci))+
+  geom_point() +
+  geom_ribbon(alpha=0.3) +
+  theme_bw() +
+  geom_line(aes(x=Age,y=mean)) +
+  ylab("Length") +
+  ggtitle("A von Bertalanffy growth curve of measured white perch otoliths")
+
+```
+
+```{r}
+# Take a subset of the jags runs to make gelman plots
+mcmc1 <- as.mcmc(wtpjags)
+params_of_interest <- c("K","Linf","Age0", "deviance")
+subset_mcmc1 <- mcmc1[, params_of_interest, drop = FALSE]
+gelman.plot(subset_mcmc1)
+```
+
+### Model 2: Measured Otoliths and Back-Calculated Lengths Growth Curve
+
+```{r}
+##### All Measured Data and Back-Calculations #####
+write("model
+      {
+      for(i in 1:1368){
+        PredL[i] <- Linf * (1 - exp(-K*(Age[i] - Age0)))
+        logPredL[i] <- log(PredL[i])
+        Length[i] ~ dlnorm(logPredL[i], tau)
+        			  logObsL[i] <-log(Length[i]) 	     # log transfomration of observed value
+			  resid[i] <- logObsL[i]-logPredL[i]  # residuals
+		 	  Rep[i] ~ dlnorm(logPredL[i], tau) # replicated data set
+		 	  logRep[i] <-log(Rep[i]) # replicated data set
+		 	  Prob[i] <- step(logRep[i] - logObsL[i])  # Probability replicated data>real data
+        sresid2[i]<-(logObsL[i]-logPredL[i])*(logObsL[i]-logPredL[i])*tau   # stand. residuals squared
+        rep.sresid2[i]<-(logRep[i]-logPredL[i])*(logRep[i]-logPredL[i])*tau  # replicated sresid squared
+        sstest[i] <- (logObsL[i]-logMean)*(logObsL[i]-logMean)*tau 
+      }
+      #priors specification
+      K ~ dunif(0,2)
+      Age0 ~ dunif(-10,0)
+      Linf ~ dunif(200,400)
+      tau ~ dgamma(0.001,0.001)
+      
+      #Derived parameters
+      logMean <-mean(logObsL[])
+      mean.prob<-mean(Prob[])
+      chi.square.obs<-sum(sresid2[])
+      chi.square.rep<-sum(rep.sresid2[])
+      sstot <-sum(sstest[])
+      p.value<-step(chi.square.obs-chi.square.rep)
+      r.squared <- 1-(chi.square.obs/sstot)
+      r.squared2 <-1-1/(tau*sd(logObsL[])*sd(logObsL[]))
+      }", file = "vonBwtp2.txt")
+
+# make a copy of cleaned_wtpa for this model
+wtp <- cleaned_wtpa
+
+# run the model
+wtpjags3=jags(wtp,list(init1,init2),model.file="vonBwtp2.txt",
+             parameters.to.save=c("K","Linf","tau", "Age0","r.squared", "p.value","r.squared2",
+                                  "PredL","logPredL"),
+             n.chains=2,n.iter=400000,n.burnin=50000,n.thin=100)
+
+# view model outputs
+res2=wtpjags3$BUGSoutput
+round(res2$summary[c("Age0", "K","Linf","p.value","r.squared","r.squared2"),c("mean","sd","2.5%","50%","97.5%","Rhat","n.eff")],5)
+
+```
+
+```{r}
+# select some of the results and plot them
+df2<-data.frame(res2$summary[paste0("PredL[",1:1368,"]"),c("mean","2.5%","50%","97.5%")])
+names(df2)<-c("mean","lci","median","uci")
+df2<-cbind(df2, wtp)
+ggplot(df2, aes(x=Age, y=Length, ymin=lci, ymax=uci)) +
+  geom_point() +
+  geom_ribbon(alpha=0.3) +
+  theme_bw() +
+  geom_line(aes(x=Age,y=mean)) +
+  ylab("Length") +
+  ggtitle("A von Bertalanffy growth curve of all types of white perch otoliths")
+
+
+```
+
+```{r}
+# Take a subset of the jags runs to make gelman plots
+mcmc2 <- as.mcmc(wtpjags3)
+subset_mcmc2 <- mcmc2[, params_of_interest, drop = FALSE]
+gelman.plot(subset_mcmc2)
+```
+
+### Model 3: Modified Sample of Ages 1-5 Growth Curve
+
+```{r}
+##### Subset #####
+# The final model used a subsample of ages 1-5 where each age had 100 samples where the measured length at ages were supplemented by however many back-calculated ages were needed to reach 100 samples.   
+
+
+# take the subset and make every age group n = 100.  
+df_3 = 0
+for(i in 1:5){
+  #only get less than or equal to age i
+  s <- filter(cleaned_wtpa, Age <= i)
+  s <- filter(s, (i-1) < Age)
+  #only get = to age i 
+  s.b <- filter(s, Type == "Back-Calc")
+  s.a <- filter(s, Type == "Measured")
+  x = 100 - nrow(s.a)
+  s.b <- sample_n(s.b, x)
+  df_3 <- rbind(df_3, s.a, s.b)
+}
+df_3 <- df_3[-1,]
+
+df_3$round <- ceiling(df_3$Age)
+
+# plot the new age histograms
+ggplot(df_3, aes(round, fill = Type)) +
+  geom_histogram(bins = 5, color = "black") +
+  scale_fill_manual(values=c("white", "black")) +
+  ggtitle("Histogram of Fish Age") + 
+  ylab("Count") + 
+  theme_classic()
+
+```
+
+```{r}
+# The subsetted model for jags
+write("model
+      {
+      for(i in 1:500){
+        PredL[i] <- Linf * (1 - exp(-K*(Age[i] - Age0)))
+        logPredL[i] <- log(PredL[i])
+        Length[i] ~ dlnorm(logPredL[i], tau)
+        logObsL[i] <-log(Length[i]) 	     # log transfomration of observed value
+			  resid[i] <- logObsL[i]-logPredL[i]  # residuals
+		 	  Rep[i] ~ dlnorm(logPredL[i], tau) # replicated data set
+		 	  logRep[i] <-log(Rep[i]) # replicated data set
+		 	  Prob[i] <- step(logRep[i] - logObsL[i])  # Probability replicated data>real data
+        sresid2[i]<-(logObsL[i]-logPredL[i])*(logObsL[i]-logPredL[i])*tau   # stand. residuals squared
+        rep.sresid2[i]<-(logRep[i]-logPredL[i])*(logRep[i]-logPredL[i])*tau  # replicated sresid squared
+        sstest[i] <- (logObsL[i]-logMean)*(logObsL[i]-logMean)*tau 
+      }
+      #priors specification
+      K ~ dunif(0,2)
+      Age0 ~ dunif(-10,0)
+      Linf ~ dunif(200,400)
+      tau ~ dgamma(0.001,0.001)
+      
+      #Derived parameters
+      logMean <-mean(logObsL[])
+      mean.prob<-mean(Prob[])
+      chi.square.obs<-sum(sresid2[])
+      chi.square.rep<-sum(rep.sresid2[])
+      sstot <-sum(sstest[])
+      p.value<-step(chi.square.obs-chi.square.rep)
+      r.squared <- 1-(chi.square.obs/sstot)
+      r.squared2 <-1-1/(tau*sd(logObsL[])*sd(logObsL[]))
+      
+      }", file = "vonBwtp3.txt")
+
+# create a copy of the data generated for the subset model
+wtp <- df_3
+
+# run the JAGS model
+wtpjags5=jags(wtp,list(init1,init2),model.file="vonBwtp3.txt",
+              parameters.to.save=c("K","Linf","tau", "Age0","r.squared", "p.value","r.squared2",
+                                   "PredL","logPredL"),
+              n.chains=2,n.iter=400000,n.burnin=50000,n.thin=100)
+
+# Print out the outputs
+res3=wtpjags5$BUGSoutput
+round(res3$summary[c("Age0", "K","Linf","p.value","r.squared","r.squared2"),c("mean","sd","2.5%","50%","97.5%","Rhat","n.eff")],5)
+
+```
+
+
+```{r}
+# subset the data and create a plot of the results
+df3<-data.frame(res3$summary[paste0("PredL[",1:500,"]"),c("mean","2.5%","50%","97.5%")])
+names(df3)<-c("mean","lci","median","uci")
+df3<-cbind(df3,wtp)
+ggplot(df3,aes(x=Age, y=Length, ymin=lci, ymax=uci)) +
+  geom_point() +
+  geom_ribbon(alpha=0.3) +
+  theme_bw() +
+  geom_line(aes(x=Age,y=mean)) +
+  ylab("Length") +
+  ggtitle("A von Bertalanffy growth curve of sub-sampled age 1-5 white perch otoliths")
+
+```
+
+```{r}
+# Take a subset of the jags runs to make gelman plots
+mcmc3 <- as.mcmc(wtpjags5)
+subset_mcmc3 <- mcmc3[, params_of_interest, drop = FALSE]
+gelman.plot(subset_mcmc3)
+```
+
+## Conclusions
+
+### Model 1: Measured Density Plots
+
+```{r}
+# Create density plots of the 3 model runs
+par(mfrow = c(2,2))
+densplot(subset_mcmc1)   
+```
+
+### Model 2: All Data Density Plots
+
+```{r}
+par(mfrow = c(2,2))
+densplot(subset_mcmc2)   
+```
+
+### Model 3: Sub-Sample Density Plots
+
+```{r}
+par(mfrow = c(2,2))
+densplot(subset_mcmc3)   
+```
+
+```{r}
+# merge the 3 model datasets for plotting
+df <- df %>% 
+  mutate(df, model = "M1:Measured") %>%
+  select(model, Age, mean)
+df2 <- df2 %>% 
+  mutate(df2, model = "M2:All Data") %>%
+  select(model, Age, mean)
+df3 <- df3 %>% 
+  mutate(df3, model = "M3:Sub-Sample") %>%
+  select(model, Age, mean)
+glm_results <- rbind(df, df2, df3)
+
+# create the final comparison plot
+ggplot(cleaned_wtpa, aes(x=Age, y=Length)) +
+  geom_point() +
+  theme_bw() +
+  geom_line(data = glm_results, aes(x=Age, y=mean, color = model)) +
+  ylab("Length") +
+  ggtitle("A comparison of three von Bertalanffy growth curves for white perch")
+
+```
